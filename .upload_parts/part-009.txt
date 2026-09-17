@@ -1,0 +1,325 @@
+act.content || '', '');
+        }
+        return lines.join('\n').trim() + '\n';
+    }
+
+    function canvasFailuresToMarkdown(failures) {
+        const lines = ['# Gemini Canvas Scan Failures', '', `Total failures: ${failures.length}`, ''];
+        failures.forEach((f, i) => {
+            lines.push(`## ${i + 1}. ${f.title || 'Unknown title'}`, '');
+            lines.push(`- ID: \`${f.chat_id || f.id || ''}\``);
+            lines.push(`- URL: ${f.url || ''}`);
+            lines.push(`- Error: ${f.error || ''}`);
+            lines.push(`- Failed at: ${f.failed_at || ''}`, '');
+        });
+        return lines.join('\n');
+    }
+
+    // ---------------------------- Output --------------------------------
+    function blocksToMarkdown(item, blocks, meta = {}, canvases = []) {
+        const lines = [];
+        lines.push(`# ${item.title || 'Gemini Conversation'}`);
+        lines.push('');
+        lines.push(`- Conversation ID: \`${item.chatId}\``);
+        lines.push(`- URL: ${buildConversationUrl(item)}`);
+        lines.push(`- Exported: ${meta.exported_at || new Date().toISOString()}`);
+        lines.push(`- Turns: ${blocks.length}`);
+        lines.push(`- Canvas artifacts: ${canvases.length}`);
+        lines.push('');
+        lines.push('---');
+        lines.push('');
+
+        for (const block of blocks) {
+            const u = escapeMdInline(block.userText || '').trim();
+            const t = escapeMdInline(block.thoughtsText || '').trim();
+            const a = escapeMdInline(block.assistantText || '').trim();
+            if (u) {
+                lines.push('## User', '', u, '');
+            }
+            if (t) {
+                lines.push('## Thoughts', '', t, '');
+            }
+            if (a) {
+                lines.push('## Assistant', '', a, '');
+            }
+            lines.push('---', '');
+        }
+
+        if (canvases.length) {
+            lines.push('# Canvas / Artifacts', '');
+            canvases.forEach((artifact, idx) => {
+                lines.push(`## Canvas ${idx + 1}: ${artifact.title || 'Untitled Canvas'}`, '');
+                lines.push(`- Type: ${artifact.type || 'document'}`);
+                if (artifact.language) lines.push(`- Language: ${artifact.language}`);
+                lines.push(`- SHA-256: \`${artifact.content_sha256 || ''}\``, '');
+                if (artifact.type === 'code') {
+                    lines.push(`\`\`\`${artifact.language || ''}`, artifact.content || '', '\`\`\`', '');
+                } else {
+                    lines.push(artifact.content || '', '');
+                }
+                lines.push('---', '');
+            });
+        }
+        return lines.join('\n').trim() + '\n';
+    }
+
+    function canvasArtifactOutputStem(artifact) {
+        let name = sanitizeFilename(artifact?.title || artifact?.filename || 'Canvas');
+        name = name.replace(/\.(?:md|markdown|txt|html?|js|mjs|cjs|ts|tsx|jsx|py|java|kt|go|rs|cpp|c|cs|json|ya?ml|xml|css|sql|sh|ps1)$/i, '');
+        return name || 'Canvas';
+    }
+
+    function uniqueBaseFilename(item, index) {
+        const short = String(item.chatId || item.id).replace(/^c_/, '').slice(-12);
+        const n = String(index + 1).padStart(4, '0');
+        return `${n}_${sanitizeFilename(item.title)}_${short}`;
+    }
+
+    function failuresToMarkdown(failures) {
+        const lines = ['# Gemini Export Failures', '', `Total failures: ${failures.length}`, ''];
+        failures.forEach((f, i) => {
+            lines.push(`## ${i + 1}. ${f.title || 'Unknown title'}`);
+            lines.push('');
+            lines.push(`- ID: \`${f.chatId || f.id}\``);
+            lines.push(`- URL: ${f.url || ''}`);
+            lines.push(`- Error: ${f.error || ''}`);
+            lines.push(`- Failed at: ${f.failed_at || ''}`);
+            lines.push('');
+        });
+        return lines.join('\n');
+    }
+
+    // ------------------------------ UI ----------------------------------
+    function mainButtonLabel() {
+        return 'Gemini 导出（单个 / 全量）';
+    }
+
+    function escapeHtmlUi(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function formatListTime(ms) {
+        if (!ms) return '';
+        try { return new Date(ms).toLocaleString(); } catch (_) { return String(ms); }
+    }
+
+    function style(el, props) {
+        Object.assign(el.style, props);
+        return el;
+    }
+
+    function makeButton(text, props = {}) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = text;
+        style(b, {
+            cursor: 'pointer',
+            fontFamily: 'Arial, sans-serif',
+            ...props,
+        });
+        return b;
+    }
+
+    function makeText(tag, text, props = {}) {
+        const el = document.createElement(tag);
+        el.textContent = text;
+        style(el, props);
+        return el;
+    }
+
+    function showExportModeDialog() {
+        if (running) return;
+        try {
+            const old = document.getElementById('gue-export-mode-overlay');
+            if (old) old.remove();
+
+            const overlay = style(document.createElement('div'), {
+                position: 'fixed', inset: '0', zIndex: '2147483647',
+                background: 'rgba(0,0,0,.52)', display: 'flex',
+                alignItems: 'center', justifyContent: 'center',
+            });
+            overlay.id = 'gue-export-mode-overlay';
+
+            const dialog = style(document.createElement('div'), {
+                width: '520px', maxWidth: '92vw', background: '#fff', color: '#202124',
+                borderRadius: '14px', padding: '20px', boxSizing: 'border-box',
+                fontFamily: 'Arial, sans-serif', boxShadow: '0 14px 50px rgba(0,0,0,.32)',
+            });
+
+            dialog.appendChild(makeText('div', 'Gemini 对话导出', {
+                fontSize: '19px', fontWeight: '700', marginBottom: '6px'
+            }));
+            dialog.appendChild(makeText('div',
+                '单个模式只抓你选中的 1 条完整详情和 Canvas；全量模式才会逐条抓整个账号。两种模式使用同一套导出管线。',
+                { fontSize: '13px', color: '#5f6368', lineHeight: '1.55', marginBottom: '16px' }
+            ));
+
+            const stack = style(document.createElement('div'), {
+                display: 'flex', flexDirection: 'column', gap: '10px'
+            });
+
+            const single = makeButton('单个对话导出（推荐先测试 Canvas）', {
+                padding: '14px', textAlign: 'left', border: '1px solid #1a73e8',
+                borderRadius: '10px', background: '#e8f0fe', width: '100%',
+                color: '#174ea6', fontWeight: '700', fontSize: '15px',
+            });
+            single.id = 'gue-single-export-btn';
+            single.title = '先获取对话列表，再搜索并选择 1 条；只请求这一条详情。';
+
+            const full = makeButton('全量导出', {
+                padding: '14px', textAlign: 'left', border: '1px solid #dadce0',
+                borderRadius: '10px', background: '#f8f9fa', width: '100%',
+                color: '#202124', fontWeight: '700', fontSize: '15px',
+            });
+            full.id = 'gue-full-export-btn';
+            full.title = '获取列表后，逐条导出全部历史。';
+
+            stack.appendChild(single);
+            stack.appendChild(full);
+            dialog.appendChild(stack);
+
+            const footer = style(document.createElement('div'), {
+                display: 'flex', justifyContent: 'flex-end', marginTop: '16px'
+            });
+            const cancel = makeButton('取消', {
+                padding: '9px 14px', border: '1px solid #dadce0',
+                borderRadius: '8px', background: '#fff'
+            });
+            cancel.id = 'gue-mode-cancel-btn';
+            footer.appendChild(cancel);
+            dialog.appendChild(footer);
+
+            const close = () => overlay.remove();
+            single.addEventListener('click', () => {
+                close();
+                startFullExport({ mode: 'single' });
+            });
+            full.addEventListener('click', () => {
+                close();
+                startFullExport({ mode: 'full' });
+            });
+            cancel.addEventListener('click', close);
+            const openedAt = performance.now();
+            overlay.addEventListener('click', e => {
+                // A rapid second click from a double-click on the fixed launcher can
+                // land on the freshly-created backdrop. Ignore that initial click.
+                if (e.target === overlay && performance.now() - openedAt > 350) close();
+            });
+
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+            console.info('[Gemini Universal Exporter] mode dialog opened');
+        } catch (error) {
+            console.error('[Gemini Universal Exporter] failed to open mode dialog', error);
+            alert(`Gemini 导出器 UI 打开失败：${error?.message || error}`);
+        }
+    }
+
+    function showSingleConversationDialog(items) {
+        return new Promise(resolve => {
+            try {
+                const old = document.getElementById('gue-single-select-overlay');
+                if (old) old.remove();
+
+                const overlay = style(document.createElement('div'), {
+                    position: 'fixed', inset: '0', zIndex: '2147483647',
+                    background: 'rgba(0,0,0,.52)', display: 'flex',
+                    alignItems: 'center', justifyContent: 'center',
+                });
+                overlay.id = 'gue-single-select-overlay';
+
+                const dialog = style(document.createElement('div'), {
+                    background: '#fff', color: '#202124', width: '780px', maxWidth: '94vw',
+                    height: '760px', maxHeight: '88vh', borderRadius: '14px',
+                    boxShadow: '0 14px 50px rgba(0,0,0,.32)', padding: '18px',
+                    boxSizing: 'border-box', fontFamily: 'Arial, sans-serif',
+                    display: 'flex', flexDirection: 'column', gap: '11px',
+                });
+
+                dialog.appendChild(makeText('div', '选择 1 条 Gemini 对话', {
+                    fontSize: '18px', fontWeight: '700', marginBottom: '2px'
+                }));
+                dialog.appendChild(makeText('div',
+                    `已通过 MaZiqc 加载 ${items.length} 条唯一历史记录。这里只加载列表；选择后才请求这一条完整详情和 Canvas。`,
+                    { fontSize: '13px', color: '#5f6368', lineHeight: '1.45' }
+                ));
+
+                const search = document.createElement('input');
+                search.type = 'search';
+                search.placeholder = '搜索标题或对话 ID，例如：20260109健身';
+                style(search, {
+                    padding: '9px 10px', border: '1px solid #dadce0',
+                    borderRadius: '8px', fontSize: '14px',
+                });
+                dialog.appendChild(search);
+
+                const status = makeText('div', '', { fontSize: '12px', color: '#5f6368' });
+                dialog.appendChild(status);
+
+                const list = style(document.createElement('div'), {
+                    flex: '1', overflow: 'auto', border: '1px solid #dadce0',
+                    borderRadius: '9px', background: '#f8f9fa', padding: '5px',
+                });
+                dialog.appendChild(list);
+
+                const footer = style(document.createElement('div'), {
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px'
+                });
+                footer.appendChild(makeText('div',
+                    '单个测试只会抓 1 条详情，不会循环请求整个账号。',
+                    { fontSize: '12px', color: '#5f6368' }
+                ));
+                const actions = style(document.createElement('div'), { display: 'flex', gap: '8px' });
+                const cancel = makeButton('取消', {
+                    padding: '9px 13px', border: '1px solid #dadce0',
+                    borderRadius: '8px', background: '#fff'
+                });
+                const startBtn = makeButton('导出这一条', {
+                    padding: '9px 13px', border: 'none', borderRadius: '8px',
+                    background: '#1a73e8', color: '#fff', fontWeight: '700'
+                });
+                startBtn.disabled = true;
+                startBtn.style.opacity = '.55';
+                actions.appendChild(cancel);
+                actions.appendChild(startBtn);
+                footer.appendChild(actions);
+                dialog.appendChild(footer);
+
+                overlay.appendChild(dialog);
+                document.body.appendChild(overlay);
+
+                let selectedId = null;
+                let visibleItems = items.slice();
+
+                function render() {
+                    const q = search.value.trim().toLowerCase();
+                    visibleItems = q
+                        ? items.filter(it =>
+                            String(it.title || '').toLowerCase().includes(q) ||
+                            String(it.chatId || it.id || '').toLowerCase().includes(q)
+                        )
+                        : items.slice();
+
+                    while (list.firstChild) list.removeChild(list.firstChild);
+
+                    if (!visibleItems.length) {
+                        list.appendChild(makeText('div', '没有匹配结果', {
+                            padding: '20px', color: '#80868b'
+                        }));
+                    } else {
+                        for (const it of visibleItems) {
+                            const row = style(document.createElement('label'), {
+                                display: 'flex', gap: '10px', alignItems: 'flex-start',
+                                padding: '9px', borderBottom: '1px solid #e8eaed',
+                                cursor: 'pointer', background: '#fff',
+                            });
+
+                            const radio = document.createElement('input');
+                            radio.type = 'radio';
+                            radio.name = 'gue-single-conversation';
+                            radio.value = String(it.id);
+                           
