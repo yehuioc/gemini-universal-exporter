@@ -1,0 +1,340 @@
+                payloads = await rpcCall(session, CONFIG.DETAIL_RPC_ID, [rawId, CONFIG.DETAIL_PAGE_SIZE, null, 1, detailFilter, [4], null, 1], item.sourcePath, setStatus, '对话详情兼容探测');
+                payload = payloads.find(p => Array.isArray(p?.[0])) || payloads[0];
+                turns = extractTurnsArrayFromDetailPayload(payload);
+                next = detailNextCursor(payload);
+            }
+
+            if (!Array.isArray(payload)) throw new Error('hNvQHb 返回 payload 结构异常。');
+            if (cursor && !turns.length && next) throw new Error('hNvQHb 分页出现空页但仍有 next cursor；拒绝输出可能截断的对话。');
+            payloadsOut.push(payload);
+            setStatus(`📄 ${item.title} · 详情第 ${page + 1} 页 · 累计 ${payloadsOut.reduce((n, p) => n + extractTurnsArrayFromDetailPayload(p).length, 0)} turns`);
+
+            if (!next) break;
+            if (next === cursor || seenCursors.has(next)) throw new Error('hNvQHb 返回重复 cursor；拒绝死循环/部分导出。');
+            seenCursors.add(next);
+            cursor = next;
+            await sleep(randomBetween(250, 700));
+            if (page === CONFIG.DETAIL_MAX_PAGES - 1) throw new Error(`hNvQHb 超过 ${CONFIG.DETAIL_MAX_PAGES} 页仍未结束；拒绝部分备份。`);
+        }
+        return payloadsOut;
+    }
+
+    function parseConversationDetailPayloads(payloads) {
+        const newestFirst = [];
+        for (const payload of payloads || []) newestFirst.push(...extractTurnsArrayFromDetailPayload(payload));
+
+        // hNvQHb delivers newest-first and pages toward older history.
+        const chronologicalRaw = newestFirst.slice().reverse();
+        const seenTurnIds = new Set();
+        const parsedTurns = [];
+        let unparsedTurnCount = 0;
+        let canvasPossibleMissCount = 0;
+        const canvases = [];
+        const canvasKeys = new Set();
+
+        for (const rawTurn of chronologicalRaw) {
+            const turnId = typeof getPath(rawTurn, [0, 1]) === 'string' ? getPath(rawTurn, [0, 1]) : null;
+            if (turnId && seenTurnIds.has(turnId)) continue;
+            if (turnId) seenTurnIds.add(turnId);
+
+            const parsed = parseDetailTurn(rawTurn, parsedTurns.length + 1);
+            if (!parsed) { unparsedTurnCount++; continue; }
+            if (!parsed.userText && !parsed.assistantText && !parsed.thoughtsText && !parsed.canvas.length) unparsedTurnCount++;
+            if (parsed.canvas_possible_miss) canvasPossibleMissCount++;
+            for (const artifact of parsed.canvas) {
+                const key = artifact.document_id || `${artifact.filename || ''}\n${artifact.title}\n${artifact.content}`;
+                if (canvasKeys.has(key)) continue;
+                canvasKeys.add(key);
+                canvases.push({ ...artifact, turn_index: parsed.index });
+            }
+            parsedTurns.push(parsed);
+        }
+
+        const blocks = parsedTurns.map(t => ({
+            userText: t.userText,
+            assistantText: t.assistantText,
+            thoughtsText: t.thoughtsText,
+            timestamp_ms: t.timestamp_ms,
+            turn_id: t.turn_id,
+        })).filter(b => b.userText || b.assistantText || b.thoughtsText);
+
+        return {
+            blocks,
+            parsedTurns,
+            canvases,
+            raw_turn_count: newestFirst.length,
+            parsed_turn_count: parsedTurns.length,
+            unparsed_turn_count: unparsedTurnCount,
+            canvas_possible_miss_count: canvasPossibleMissCount,
+        };
+    }
+
+    // ------------------------- Full sidebar harvest ----------------------
+    // Gemini's sidebar has changed several times. Current builds may expose
+    // conversation ids in jslog on gem-nav-list-item instead of an <a href>.
+    // Keep multiple independent discovery strategies and merge their results.
+    function findConversationListRoot() {
+        return document.querySelector('conversations-list[data-test-id="all-conversations"]') ||
+            document.querySelector('.chat-history-list') ||
+            document.querySelector('expandable-section[data-test-id="chats-expandable-section"]') ||
+            document.querySelector('expandable-section[storagekey="chats"]') ||
+            document.querySelector('[data-test-id="chats-expandable-section"]') ||
+            null;
+    }
+
+    function findConversationRows(root = document) {
+        const selectors = [
+            'gem-nav-list-item[data-test-id="conversation"]',
+            'div[data-test-id="conversation"]',
+            '.chat-history-list gem-nav-list-item',
+            'conversations-list[data-test-id="all-conversations"] gem-nav-list-item',
+            '[data-test-id="conversation"][jslog]',
+        ];
+        const out = [];
+        const seen = new Set();
+        for (const selector of selectors) {
+            for (const el of root.querySelectorAll(selector)) {
+                if (seen.has(el)) continue;
+                seen.add(el);
+                out.push(el);
+            }
+        }
+        return out;
+    }
+
+    function findSidebarLinks() {
+        const root = findConversationListRoot();
+        const selectors = [
+            'a[href*="/app/"]',
+            'a[href*="/gem/"]',
+            'a.mat-mdc-list-item[href]',
+        ];
+        const scan = root || document;
+        const found = [];
+        const seen = new Set();
+        for (const selector of selectors) {
+            for (const a of scan.querySelectorAll(selector)) {
+                if (seen.has(a)) continue;
+                seen.add(a);
+                found.push(a);
+            }
+        }
+        // Older layouts sometimes keep the list root opaque; broad fallback.
+        if (!found.length && root) {
+            for (const selector of selectors) {
+                for (const a of document.querySelectorAll(selector)) {
+                    if (seen.has(a)) continue;
+                    seen.add(a);
+                    found.push(a);
+                }
+            }
+        }
+        return found;
+    }
+
+    function extractChatIdFromJslog(value) {
+        const raw = String(value || '');
+        if (!raw) return null;
+
+        // Current Gemini rows commonly contain JSON-ish payloads with "c_<id>".
+        // Accept escaped quotes and minor formatting changes.
+        const patterns = [
+            /(?:\\?\[|["'])c_([A-Za-z0-9_-]{6,})/,
+            /c_([A-Za-z0-9_-]{6,})/,
+        ];
+        for (const re of patterns) {
+            const m = raw.match(re);
+            if (m?.[1]) return m[1];
+        }
+        return null;
+    }
+
+    function conversationItemFromChatId(chatId) {
+        if (!chatId) return null;
+        const id = String(chatId).replace(/^c_/, '');
+        const basePrefix = currentAccountPrefix();
+        return {
+            id,
+            chatId: id,
+            kind: 'app',
+            sourcePath: `${basePrefix}/app/${id}`,
+            basePrefix,
+        };
+    }
+
+    function extractTitleFromElement(el, item) {
+        const candidates = [
+            el?.querySelector?.('.title-text')?.innerText,
+            el?.querySelector?.('[data-test-id="conversation-title"]')?.innerText,
+            el?.getAttribute?.('aria-label'),
+            el?.getAttribute?.('title'),
+            el?.innerText,
+            el?.textContent,
+        ];
+        for (const c of candidates) {
+            const value = String(c || '').replace(/\s+/g, ' ').trim();
+            if (value && value.length <= 500) return value;
+        }
+        return `Untitled ${item.chatId}`;
+    }
+
+    function extractTitleFromAnchor(a, item) {
+        const host = a.closest('gem-nav-list-item[data-test-id="conversation"], div[data-test-id="conversation"]');
+        return extractTitleFromElement(host || a, item);
+    }
+
+    function parseConversationRow(row) {
+        // Strategy A: route information still exists as a descendant anchor.
+        const a = row.querySelector?.('a[href*="/app/"], a[href*="/gem/"]');
+        if (a) {
+            const item = parseConversationHref(a.getAttribute('href'));
+            if (item) {
+                item.title = extractTitleFromElement(row, item);
+                item.href = a.getAttribute('href');
+                return item;
+            }
+        }
+
+        // Strategy B: current Gemini stores c_<conversation-id> inside jslog.
+        let node = row;
+        for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {
+            const chatId = extractChatIdFromJslog(node.getAttribute?.('jslog'));
+            if (chatId) {
+                const item = conversationItemFromChatId(chatId);
+                item.title = extractTitleFromElement(row, item);
+                item.href = item.sourcePath;
+                item.discovery = 'jslog';
+                return item;
+            }
+        }
+
+        // Strategy C: scan any jslog-bearing descendant as a final DOM fallback.
+        for (const el of row.querySelectorAll?.('[jslog]') || []) {
+            const chatId = extractChatIdFromJslog(el.getAttribute('jslog'));
+            if (!chatId) continue;
+            const item = conversationItemFromChatId(chatId);
+            item.title = extractTitleFromElement(row, item);
+            item.href = item.sourcePath;
+            item.discovery = 'jslog-descendant';
+            return item;
+        }
+        return null;
+    }
+
+    function collectConversationSnapshot() {
+        const found = [];
+        const seen = new Set();
+        const add = (item) => {
+            if (!item || !item.id || seen.has(item.id)) return;
+            seen.add(item.id);
+            found.push(item);
+        };
+
+        // New/current layouts: history rows may not have navigable hrefs.
+        const root = findConversationListRoot() || document;
+        for (const row of findConversationRows(root)) add(parseConversationRow(row));
+
+        // Older layouts and Gemini Gems: href-based discovery.
+        for (const a of findSidebarLinks()) {
+            const item = parseConversationHref(a.getAttribute('href'));
+            if (!item) continue;
+            item.title = extractTitleFromAnchor(a, item);
+            item.href = a.getAttribute('href');
+            item.discovery = item.discovery || 'href';
+            add(item);
+        }
+
+        return found;
+    }
+
+    function findSidebarOpenButton() {
+        const candidates = Array.from(document.querySelectorAll('button[aria-label], gem-icon-button[aria-label]'));
+        return candidates.find(b => {
+            const label = (b.getAttribute('aria-label') || '').toLowerCase();
+            return (
+                label.includes('open sidebar') ||
+                label.includes('show sidebar') ||
+                label.includes('navigation menu') ||
+                label.includes('main menu') ||
+                label.includes('打开侧边栏') ||
+                label.includes('显示侧边栏') ||
+                label.includes('导航菜单') ||
+                label === '菜单'
+            );
+        }) || null;
+    }
+
+    function findRecentSectionToggle() {
+        const toggles = Array.from(document.querySelectorAll(
+            '[data-test-id="expandable-section-toggle"], expandable-section button, button[aria-label], gem-button[aria-label]'
+        ));
+        return toggles.find(b => {
+            const text = `${b.getAttribute('aria-label') || ''} ${b.innerText || ''}`.toLowerCase();
+            return text.includes('recent') || text.includes('最近') || text.includes('chats') || text.includes('聊天');
+        }) || null;
+    }
+
+    function isScrollable(el) {
+        if (!el) return false;
+        const style = getComputedStyle(el);
+        const overflowY = style.overflowY;
+        return (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') &&
+            el.scrollHeight > el.clientHeight + 20;
+    }
+
+    function findSidebarScroller() {
+        const listRoot = findConversationListRoot();
+        if (listRoot) {
+            if (isScrollable(listRoot)) return listRoot;
+            let p = listRoot.parentElement;
+            while (p && p !== document.body) {
+                if (isScrollable(p)) return p;
+                p = p.parentElement;
+            }
+        }
+
+        const first = findConversationRows()[0] || findSidebarLinks()[0];
+        let p = first?.parentElement || null;
+        while (p && p !== document.body) {
+            if (isScrollable(p)) return p;
+            p = p.parentElement;
+        }
+
+        const all = Array.from(document.querySelectorAll('nav, aside, section, div, infinite-scroller, conversations-list'));
+        return all
+            .filter(isScrollable)
+            .filter(el => el.querySelector?.(
+                'gem-nav-list-item[data-test-id="conversation"], div[data-test-id="conversation"], [data-test-id="conversation"][jslog], a[href*="/app/"], a[href*="/gem/"]'
+            ))
+            .sort((a, b) => b.scrollHeight - a.scrollHeight)[0] || null;
+    }
+
+    async function ensureSidebarShellOpen() {
+        if (findConversationListRoot() || findConversationRows().length || findSidebarLinks().length) return;
+        const open = findSidebarOpenButton();
+        if (open) {
+            open.click();
+            await sleep(1400);
+        }
+    }
+
+    async function ensureChatsExpanded() {
+        const toggle = findRecentSectionToggle();
+        if (!toggle) return;
+
+        const ariaExpanded = toggle.getAttribute('aria-expanded');
+        const section = toggle.closest?.('expandable-section, [data-test-id="chats-expandable-section"]');
+        const classText = String(section?.className || '');
+        const looksCollapsed = ariaExpanded === 'false' || /\bcollapsed\b/i.test(classText);
+        if (looksCollapsed) {
+            toggle.click();
+            await sleep(1000);
+        }
+    }
+
+    function historyDomDiagnostics() {
+        const root = findConversationListRoot();
+        const rows = findConversationRows(root || document);
+        const links = findSidebarLinks();
+        const jslogSamples = Array.from(document.querySelectorAll('[jslog]'))
+            .map(el => el.getAttribute('jslog'))
