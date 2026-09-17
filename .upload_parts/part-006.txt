@@ -1,0 +1,263 @@
+) return false;
+                const hasChat = !!el.querySelector?.('user-query, model-response, .conversation-container, [data-test-id="gem-processing-card"], immersive-entry-chip');
+                const isHistoryList = !!el.querySelector?.('gem-nav-list-item[data-test-id="conversation"]');
+                return hasChat && !isHistoryList && (isScrollable(el) || el === document.scrollingElement || selector === 'main');
+            });
+            if (preferred) return preferred;
+        }
+        return document.scrollingElement || document.documentElement;
+    }
+
+    function isVisibleElement(el) {
+        if (!(el instanceof Element)) return false;
+        const style = getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    }
+
+    function normalizeCanvasTitle(value) {
+        // Preserve the user's original punctuation/casing for exported filenames/titles.
+        return String(value || '')
+            .replace(/[\u200b-\u200d\ufeff]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function canvasTitleMatchKey(value) {
+        return normalizeCanvasTitle(value).normalize('NFKC').toLowerCase();
+    }
+
+    function getCanvasCardKind(card) {
+        if (!(card instanceof Element)) return null;
+        if (card.querySelector('mat-icon[fonticon="code_blocks"], mat-icon[data-mat-icon-name="code_blocks"]')) return 'code';
+        if (card.querySelector('mat-icon[fonticon="article"], mat-icon[data-mat-icon-name="article"]')) return 'document';
+        return null;
+    }
+
+    function inferCanvasKind(el) {
+        if (!(el instanceof Element)) return null;
+        return getCanvasCardKind(el)
+            || getCanvasCardKind(el.closest?.('[data-test-id="gem-processing-card"]'))
+            || (el.querySelector?.('code-immersive-panel, xap-code-editor[data-test-id="code-editor"], .monaco-editor') ? 'code' : null)
+            || (el.querySelector?.('immersive-editor, canvas-create-button') ? 'document' : null);
+    }
+
+    function getCanvasCandidateTitle(el) {
+        if (!el) return null;
+        const scopes=[el,el.closest?.('[data-test-id="gem-processing-card"]'),el.closest?.('immersive-entry-chip'),el.closest?.('model-response, .conversation-turn, [data-message-id], [data-turn-id]')].filter(Boolean);
+        const selectors=['[data-test-id="canvas-title"]','.title-text','.card-title','[data-test-id*="title"]','h1','h2','h3'];
+        for(const scope of scopes){for(const selector of selectors){const node=scope.querySelector?.(selector);const text=normalizeCanvasTitle(node?.innerText||node?.textContent||'');if(text&&text.length<=260)return text;}}
+        const all=normalizeCanvasTitle(el.innerText||el.textContent||'');
+        const file=all.match(/([^\n]{2,220}\.(?:md|markdown|txt|html?|js|mjs|cjs|ts|tsx|jsx|py|java|kt|go|rs|cpp|c|cs|json|ya?ml|xml|css|sql|sh|ps1))\b/i);
+        return file?.[1]?.trim()||(all?all.slice(0,240):null);
+    }
+
+    function canvasResponseIdentity(el){const response=el?.closest?.('model-response, .conversation-turn, [data-message-id], [data-turn-id]');return [response?.getAttribute?.('data-message-id')||'',response?.getAttribute?.('data-turn-id')||'',response?.getAttribute?.('jslog')||''].join('~');}
+    function canvasCandidateKeyFor(el,source,kind,title){return [source||'',kind||'',title||'',el?.getAttribute?.('jslog')||'',canvasResponseIdentity(el)].join('|');}
+    function isCanvasNodeUsable(el){if(!(el instanceof Element)||el.closest('immersive-panel'))return false;if(isVisibleElement(el))return true;return !!Array.from(el.querySelectorAll?.('*')||[]).find(isVisibleElement);}
+
+    function canvasActionSignal(el) {
+        if (!(el instanceof Element)) return '';
+        return normalizeCanvasTitle(
+            el.getAttribute?.('aria-label') ||
+            el.getAttribute?.('title') ||
+            el.getAttribute?.('data-label') ||
+            el.innerText || el.textContent || ''
+        );
+    }
+
+    function isSafeCanvasActionText(text) {
+        const raw = normalizeCanvasTitle(text);
+        if (!raw) return false;
+        if (/(share|分享|download|下载|copy|复制|more|更多|menu|菜单|close|关闭|delete|删除)/i.test(raw)) return false;
+        return /^(打开|开启|查看|预览|编辑|open|view|preview|edit)$/i.test(raw);
+    }
+
+    function findSafeCanvasActionTargets(root) {
+        if (!(root instanceof Element)) return [];
+        const out = [], seen = new Set();
+        const add = el => {
+            if (!(el instanceof HTMLElement) || seen.has(el) || !isVisibleElement(el)) return;
+            seen.add(el); out.push(el);
+        };
+
+        for (const el of Array.from(root.querySelectorAll('button, a, [role="button"], [tabindex], [jslog]'))) {
+            if (isSafeCanvasActionText(canvasActionSignal(el))) add(el);
+        }
+
+        // Current Gemini can render the visible “打开/Open” as a span/div rather
+        // than a native button. Clicking the exact leaf still bubbles to Angular's
+        // delegated handler, matching the user's real click target.
+        for (const el of Array.from(root.querySelectorAll('*'))) {
+            const own = normalizeCanvasTitle(el.innerText || el.textContent || '');
+            if (!isSafeCanvasActionText(own)) continue;
+            const childSame = Array.from(el.children || []).some(child =>
+                isSafeCanvasActionText(normalizeCanvasTitle(child.innerText || child.textContent || ''))
+            );
+            if (!childSame) add(el);
+
+            let parent = el.parentElement;
+            while (parent && parent !== root) {
+                const role = parent.getAttribute?.('role') || '';
+                const tabindex = parent.getAttribute?.('tabindex');
+                const jslog = parent.getAttribute?.('jslog');
+                const tag = parent.tagName?.toLowerCase?.() || '';
+                let cursor = '';
+                try { cursor = getComputedStyle(parent).cursor || ''; } catch (_) {}
+                if (tag === 'button' || tag === 'a' || role === 'button' || tabindex != null || jslog || cursor === 'pointer') {
+                    add(parent);
+                    break;
+                }
+                parent = parent.parentElement;
+            }
+        }
+        return out;
+    }
+
+    function findSafeCanvasOpenButton(root) {
+        return findSafeCanvasActionTargets(root)[0] || null;
+    }
+
+    function addCanvasCandidate(out,seen,el,source,confidence,forcedKind=null){
+        if(!(el instanceof Element)||!isCanvasNodeUsable(el))return;
+        const kind=forcedKind||inferCanvasKind(el);const title=getCanvasCandidateTitle(el)||'Gemini Canvas';const key=canvasCandidateKeyFor(el,source,kind,title);
+        if(!key||seen.has(key))return;seen.add(key);out.push({el,key,kind,title,source,confidence});
+    }
+
+    function findCanvasCandidatesInView(){
+        const out=[],seen=new Set();
+        document.querySelectorAll('[data-test-id="gem-processing-card"]').forEach(card=>{const kind=getCanvasCardKind(card);if(kind)addCanvasCandidate(out,seen,card,'gem-processing-card','high',kind);});
+        document.querySelectorAll('immersive-entry-chip').forEach(chip=>addCanvasCandidate(out,seen,chip,'immersive-entry-chip','high'));
+        document.querySelectorAll('canvas-create-button').forEach(button=>{if(button.closest('model-response, .conversation-turn, [data-message-id], [data-turn-id]'))addCanvasCandidate(out,seen,button,'canvas-create-button','medium','document');});
+        return out;
+    }
+
+    function resolveLiveCanvasCandidate(candidate) {
+        if (!candidate) return null;
+        const expectedTitle = canvasTitleMatchKey(candidate.title || '');
+        const selectors = candidate.source === 'gem-processing-card'
+            ? ['[data-test-id="gem-processing-card"]']
+            : candidate.source === 'canvas-create-button'
+                ? ['canvas-create-button']
+                : ['immersive-entry-chip'];
+        for (const selector of selectors) {
+            for (const el of Array.from(document.querySelectorAll(selector))) {
+                if (!(el instanceof Element) || !isCanvasNodeUsable(el)) continue;
+                const title = getCanvasCandidateTitle(el) || '';
+                if (expectedTitle && canvasTitleMatchKey(title) !== expectedTitle) continue;
+                return { ...candidate, el, title: title || candidate.title, kind: candidate.kind || inferCanvasKind(el) };
+            }
+        }
+        if (candidate.el instanceof Element && candidate.el.isConnected !== false && isCanvasNodeUsable(candidate.el)) return candidate;
+        return null;
+    }
+
+    function canvasCandidateClickTargets(candidate){
+        const el=candidate?.el;if(!(el instanceof Element))return [];
+        const chip=el.matches?.('immersive-entry-chip')?el:el.closest?.('immersive-entry-chip');
+        const card=el.matches?.('[data-test-id="gem-processing-card"]')?el:el.closest?.('[data-test-id="gem-processing-card"]');
+        const root=chip||card||el;
+        const targets=[];
+
+        if(candidate.source==='immersive-entry-chip'){
+            targets.push(...findSafeCanvasActionTargets(root));
+            if(chip instanceof HTMLElement)targets.push(chip);
+        } else if(candidate.source==='gem-processing-card'){
+            if(card instanceof HTMLElement)targets.push(card); // Ophel's current strategy
+            if(chip instanceof HTMLElement)targets.push(chip);
+            targets.push(...findSafeCanvasActionTargets(root));
+        } else if(candidate.source==='canvas-create-button'){
+            targets.push(...findSafeCanvasActionTargets(root));
+            if(chip instanceof HTMLElement)targets.push(chip);
+            if(el instanceof HTMLElement)targets.push(el);
+        }
+
+        const icon=root.querySelector?.('mat-icon[fonticon="article"], mat-icon[data-mat-icon-name="article"], mat-icon[fonticon="code_blocks"], mat-icon[data-mat-icon-name="code_blocks"]');
+        if(icon instanceof HTMLElement)targets.push(icon);
+
+        const seen=new Set();return targets.filter(x=>x instanceof HTMLElement&&!seen.has(x)&&seen.add(x));
+    }
+    function canvasCardClickTargets(card){return canvasCandidateClickTargets({el:card,source:'gem-processing-card',kind:getCanvasCardKind(card),title:getCanvasCandidateTitle(card)||'Gemini Canvas'});}
+
+    function canvasClickTargetDescription(target) {
+        if (!(target instanceof Element)) return 'unknown';
+        const text = canvasActionSignal(target).slice(0, 80);
+        return [target.tagName?.toLowerCase?.() || '', target.getAttribute?.('role') || '', target.getAttribute?.('data-test-id') || '', text].filter(Boolean).join(':');
+    }
+
+    function performCanvasClick(target, mode = 'native') {
+        if (!(target instanceof HTMLElement)) return false;
+        try { target.focus?.({ preventScroll: true }); } catch (_) {}
+        if (mode === 'native') {
+            // Matches Ophel's current SiteAdapter.simulateClick implementation.
+            try { target.click(); return true; } catch (_) { return false; }
+        }
+        if (mode === 'mouse') {
+            let rect = null;
+            try { rect = target.getBoundingClientRect(); } catch (_) {}
+            const clientX = rect ? rect.left + rect.width / 2 : 0;
+            const clientY = rect ? rect.top + rect.height / 2 : 0;
+            for (const type of ['mousedown','mouseup','click']) {
+                try { target.dispatchEvent(new MouseEvent(type,{bubbles:true,cancelable:true,composed:true,button:0,buttons:type==='mousedown'?1:0,view:window,clientX,clientY})); } catch (_) {}
+            }
+            return true;
+        }
+        if (mode === 'keyboard') {
+            try {
+                target.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true,cancelable:true}));
+                target.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',bubbles:true,cancelable:true}));
+                return true;
+            } catch (_) { return false; }
+        }
+        return false;
+    }
+
+    function simulateCanvasClick(target) {
+        performCanvasClick(target, 'native');
+    }
+
+    function findOpenCanvasPanel() {
+        const selectors = [
+            'immersive-panel code-immersive-panel',
+            'immersive-panel extended-response-panel:has(canvas-create-button)',
+            'immersive-panel immersive-editor',
+            'code-immersive-panel',
+            'immersive-editor',
+        ];
+        for (const selector of selectors) {
+            const node = Array.from(document.querySelectorAll(selector)).find(isVisibleElement);
+            if (!node) continue;
+            return node.closest?.('immersive-panel') || node;
+        }
+        return null;
+    }
+
+    function getCanvasTitle(panel) {
+        const selectors = [
+            'toolbar h2.title-text',
+            '[data-test-id="canvas-title"]',
+            '.immersive-editor-header h1',
+            '.immersive-editor-title',
+            'h2.title-text',
+            '.title-text',
+            '.card-title',
+            'input[aria-label*="title" i]',
+            'textarea[aria-label*="title" i]',
+            'h1',
+        ];
+        for (const selector of selectors) {
+            const el = panel.querySelector?.(selector);
+            if (!el) continue;
+            const raw = ('value' in el && /^(INPUT|TEXTAREA)$/.test(el.tagName)) ? el.value : (el.innerText || el.textContent || '');
+            const text = normalizeCanvasTitle(raw);
+            if (text) return text.slice(0, 240);
+        }
+        return 'Untitled Canvas';
+    }
+
+    function canvasPanelMatchesTitle(panel, expectedTitle) {
+        const expectedDisplay = normalizeCanvasTitle(expectedTitle);
+        if (!expectedDisplay || expectedDisplay === 'Gemini Canvas') return true;
+        const actualDisplay = normalizeCanvasTitle(getCanvasTitle(panel));
+        if (!actualDispla
