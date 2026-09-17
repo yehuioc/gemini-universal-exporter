@@ -1,0 +1,341 @@
+            .filter(v => /c_[A-Za-z0-9_-]{6,}/.test(v || ''))
+            .slice(0, 5);
+        return {
+            url: location.href,
+            listRoot: root ? `${root.tagName.toLowerCase()}${root.id ? '#'+root.id : ''}.${String(root.className || '').replace(/\s+/g,'.')}` : null,
+            rowCount: rows.length,
+            linkCount: links.length,
+            jslogConversationSamples: jslogSamples,
+            sidebarButton: findSidebarOpenButton()?.getAttribute?.('aria-label') || null,
+            recentToggle: findRecentSectionToggle()?.getAttribute?.('aria-label') || findRecentSectionToggle()?.innerText || null,
+        };
+    }
+
+    async function harvestAllConversations(setStatus) {
+        setStatus('📂 正在展开 Gemini 历史列表…');
+
+        // Important ordering: first open the sidebar shell, THEN expand Recent/Chats,
+        // only then decide whether history is empty. v0.2.0 validated too early.
+        await ensureSidebarShellOpen();
+        await ensureChatsExpanded();
+        await sleep(500);
+
+        const merged = new Map();
+        const absorb = () => {
+            for (const item of collectConversationSnapshot()) {
+                const old = merged.get(item.id);
+                if (!old) merged.set(item.id, item);
+                else if ((!old.title || /^Untitled/.test(old.title)) && item.title) merged.set(item.id, { ...old, ...item });
+            }
+        };
+
+        absorb();
+        if (!merged.size) {
+            // One more chance after a forced sidebar/toggle cycle.
+            const open = findSidebarOpenButton();
+            if (open) {
+                open.click();
+                await sleep(1000);
+            }
+            await ensureChatsExpanded();
+            await sleep(600);
+            absorb();
+        }
+
+        if (!merged.size) {
+            const diag = historyDomDiagnostics();
+            console.error('[Gemini Universal Exporter] history discovery diagnostics:', diag);
+            throw new Error(
+                `历史列表仍为空。DOM诊断: rows=${diag.rowCount}, links=${diag.linkCount}, jslogSamples=${diag.jslogConversationSamples.length}。` +
+                '请把控制台中 history discovery diagnostics 那一整项发给我。'
+            );
+        }
+
+        const scroller = findSidebarScroller();
+        if (!scroller) {
+            setStatus(`📋 找到 ${merged.size} 条对话（未检测到懒加载滚动容器）`);
+            return Array.from(merged.values());
+        }
+
+        let stable = 0;
+        let lastSize = -1;
+        let lastHeight = -1;
+
+        // Start from the top so repeated runs are deterministic.
+        try { scroller.scrollTop = 0; } catch (_) {}
+        await sleep(350);
+        absorb();
+
+        for (let round = 0; round < CONFIG.LIST_MAX_SCROLL_ROUNDS && stable < CONFIG.LIST_STABLE_ROUNDS; round++) {
+            isCancelled();
+            const beforeTop = scroller.scrollTop;
+            const beforeHeight = scroller.scrollHeight;
+
+            // Move in large pages rather than only assigning scrollHeight; some
+            // virtualized lists load the next page only after intermediate scroll events.
+            const step = Math.max(scroller.clientHeight * 0.85, 500);
+            scroller.scrollTop = Math.min(scroller.scrollTop + step, scroller.scrollHeight);
+            await sleep(listJitter());
+            absorb();
+
+            // If already near bottom, explicitly hit the bottom to trigger lazy load.
+            if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 80) {
+                scroller.scrollTop = scroller.scrollHeight;
+                await sleep(Math.max(500, CONFIG.LIST_SCROLL_DELAY_MIN));
+                absorb();
+            }
+
+            const size = merged.size;
+            const height = scroller.scrollHeight;
+            setStatus(`📂 加载全部历史… 已发现 ${size} 条`);
+
+            const noNewIds = size === lastSize;
+            const noNewHeight = height === lastHeight;
+            const noMovement = scroller.scrollTop === beforeTop && height === beforeHeight;
+            if (noNewIds && noNewHeight && noMovement) stable++;
+            else if (noNewIds && noNewHeight && scroller.scrollTop + scroller.clientHeight >= height - 80) stable++;
+            else stable = 0;
+
+            lastSize = size;
+            lastHeight = height;
+        }
+
+        // Return to top, then absorb once more because of list virtualization.
+        try { scroller.scrollTop = 0; } catch (_) {}
+        await sleep(500);
+        absorb();
+
+        const items = Array.from(merged.values());
+        if (!items.length) throw new Error('最终没有收集到任何历史对话 ID。Gemini 页面结构可能已经变化。');
+        return items;
+    }
+
+    // ------------------------ batchexecute request -----------------------
+    async function fetchConversationPayloadText(item, setStatus) {
+        const at = getAtToken();
+        if (!at) throw new Error('无法找到 Gemini anti-CSRF token (SNlM0e / at)。请刷新 Gemini 页面后重试。');
+
+        const convKey = item.chatId.startsWith('c_') ? item.chatId : `c_${item.chatId}`;
+        const innerArgs = JSON.stringify([convKey, CONFIG.DETAIL_PAGE_SIZE, null, 1, [1], [4], null, 1]);
+        const fReq = [[[CONFIG.DETAIL_RPC_ID, innerArgs, null, 'generic']]];
+
+        const params = new URLSearchParams({
+            rpcids: CONFIG.DETAIL_RPC_ID,
+            'source-path': item.sourcePath,
+            hl: getLang(),
+            rt: 'c',
+        });
+
+        const body = new URLSearchParams({
+            'f.req': JSON.stringify(fReq),
+            at,
+        });
+
+        let lastError = null;
+        for (let attempt = 1; attempt <= CONFIG.MAX_RETRIES; attempt++) {
+            isCancelled();
+            try {
+                const res = await fetch(`${getBatchUrl(item)}?${params.toString()}`, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {
+                        'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                        'x-same-domain': '1',
+                        'accept': '*/*',
+                    },
+                    body: body.toString() + '&',
+                });
+
+                if (res.ok) return await res.text();
+
+                const retryable = res.status === 429 || [500, 502, 503, 504].includes(res.status);
+                const txt = await res.text().catch(() => '');
+                if (!retryable) {
+                    throw new Error(`Gemini RPC ${res.status} ${res.statusText}: ${txt.slice(0, 240)}`);
+                }
+
+                const retryAfter = parseRetryAfterMs(res.headers);
+                const waitMs = retryAfter ?? (
+                    res.status === 429
+                        ? CONFIG.RATE_LIMIT_FALLBACK_MS + randomBetween(0, 60000)
+                        : Math.min(
+                            CONFIG.SERVER_ERROR_MAX_MS,
+                            CONFIG.SERVER_ERROR_BASE_MS * Math.pow(2, attempt - 1) + randomBetween(0, 12000)
+                        )
+                );
+
+                lastError = new Error(`HTTP ${res.status}`);
+                setStatus(`⏳ HTTP ${res.status}，第 ${attempt}/${CONFIG.MAX_RETRIES} 次；冷却 ${Math.round(waitMs / 1000)} 秒…`);
+                await sleep(waitMs);
+            } catch (e) {
+                lastError = e;
+                if (/用户已取消/.test(String(e?.message || e))) throw e;
+                if (attempt >= CONFIG.MAX_RETRIES) break;
+
+                // For explicit non-retryable HTTP errors generated above, don't hammer.
+                const msg = String(e?.message || e);
+                if (/Gemini RPC (400|401|403|404)/.test(msg)) throw e;
+
+                const waitMs = Math.min(
+                    CONFIG.SERVER_ERROR_MAX_MS,
+                    CONFIG.SERVER_ERROR_BASE_MS * Math.pow(2, attempt - 1) + randomBetween(0, 10000)
+                );
+                setStatus(`⏳ 请求异常，第 ${attempt}/${CONFIG.MAX_RETRIES} 次；等待 ${Math.round(waitMs / 1000)} 秒…`);
+                await sleep(waitMs);
+            }
+        }
+
+        throw lastError || new Error('Gemini RPC 多次重试后仍失败');
+    }
+
+    // ----------------------- batchexecute parser -------------------------
+    function parseBatchExecute(text, targetRpcId = CONFIG.DETAIL_RPC_ID) {
+        if (text.startsWith(")]}'\n")) {
+            const nl = text.indexOf('\n');
+            text = nl >= 0 ? text.slice(nl + 1) : '';
+        }
+
+        const lines = text.split('\n').filter(l => l.trim().length > 0);
+        const payloads = [];
+
+        for (let i = 0; i < lines.length;) {
+            const lenStr = lines[i++];
+            const len = parseInt(lenStr, 10);
+            if (!Number.isFinite(len)) break;
+
+            const jsonLine = lines[i++] || '';
+            let segment;
+            try { segment = JSON.parse(jsonLine); }
+            catch (_) { continue; }
+
+            if (!Array.isArray(segment)) continue;
+            for (const entry of segment) {
+                if (Array.isArray(entry) && entry[0] === 'wrb.fr' && entry[1] === targetRpcId) {
+                    const s = entry[2];
+                    if (typeof s === 'string') {
+                        try { payloads.push(JSON.parse(s)); }
+                        catch (_) {}
+                    }
+                }
+            }
+        }
+        return payloads;
+    }
+
+    // ---------------------- Gemini payload extractor ---------------------
+    // This intentionally mirrors the resilient extraction strategy of the
+    // referenced Gemini Markdown exporter rather than hardcoding one deep index.
+    function stdLB(text) {
+        return String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    }
+
+    function collectStrings(node, out = []) {
+        if (typeof node === 'string') out.push(node);
+        else if (Array.isArray(node)) for (const child of node) collectStrings(child, out);
+        return out;
+    }
+
+    function cleanStrings(node) {
+        return collectStrings(node).map(s => s.trim()).filter(Boolean);
+    }
+
+    function looksLikeInternalId(s) {
+        return /^(?:c_|rc_|r_)[A-Za-z0-9_-]{6,}$/.test(String(s || '').trim());
+    }
+
+    function isUserMessageNode(node, loose = false) {
+        if (!Array.isArray(node) || node.length < 2 || !Array.isArray(node[0]) || typeof node[1] !== 'number') return false;
+        if (!loose && node[1] !== 1 && node[1] !== 2) return false;
+        if (loose && (node[1] < 0 || node[1] > 9)) return false;
+        return cleanStrings(node[0]).some(Boolean);
+    }
+
+    function getUserTextFromNode(userNode) {
+        try {
+            return cleanStrings(userNode[0]).filter(s => !looksLikeInternalId(s)).join('\n').trim();
+        } catch (_) { return ''; }
+    }
+
+    function looksLikeAssistantId(id) {
+        if (typeof id !== 'string') return false;
+        return id.startsWith('rc_') || id.startsWith('r_') || /^response[_-]/i.test(id);
+    }
+
+    function isAssistantNode(node) {
+        if (!Array.isArray(node) || node.length < 2 || typeof node[0] !== 'string' || !Array.isArray(node[1])) return false;
+        if (looksLikeAssistantId(node[0])) return true;
+
+        const direct = typeof node[1]?.[0] === 'string' ? node[1][0].trim() : '';
+        return direct.length > 20 && /[\s\n.,!?`*_#]/.test(direct) && !looksLikeInternalId(node[0]) && !node[0].startsWith('c_');
+    }
+
+    function getAssistantTextFromNode(assistantNode) {
+        try {
+            const primary = assistantNode?.[1]?.[0];
+            if (typeof primary === 'string') return primary;
+            if (Array.isArray(primary)) {
+                const joined = cleanStrings(primary).filter(s => !looksLikeInternalId(s)).join('\n\n').trim();
+                if (joined) return joined;
+            }
+            return cleanStrings(assistantNode?.[1] || []).filter(s => !looksLikeInternalId(s)).join('\n\n').trim();
+        } catch (_) { return ''; }
+    }
+
+    function findThoughtCandidate(node) {
+        if (!Array.isArray(node)) return null;
+
+        if (
+            node.length >= 2 && Array.isArray(node[1]) && node[1].length >= 1 &&
+            Array.isArray(node[1][0]) && node[1][0].length >= 1 &&
+            node[1][0].every(x => typeof x === 'string')
+        ) {
+            const txt = node[1][0].join('\n\n').trim();
+            if (txt) return txt;
+        }
+
+        if (Array.isArray(node[0]) && node[0].length >= 1 && node[0].every(x => typeof x === 'string')) {
+            const txt = node[0].join('\n\n').trim();
+            if (txt) return txt;
+        }
+
+        for (let i = node.length - 1; i >= 0; i--) {
+            const found = findThoughtCandidate(node[i]);
+            if (found) return found;
+        }
+        return null;
+    }
+
+    function extractReasoningFromAssistantNode(assistantNode, assistantText = '') {
+        if (!Array.isArray(assistantNode)) return null;
+        const normalize = s => stdLB(String(s || '')).trim();
+        const assistantNorm = normalize(assistantText);
+        for (let k = assistantNode.length - 1; k >= 2; k--) {
+            const txt = findThoughtCandidate(assistantNode[k]);
+            if (txt && normalize(txt) !== assistantNorm) return txt;
+        }
+        return null;
+    }
+
+    function isTimestampPair(arr) {
+        return Array.isArray(arr) && arr.length === 2 && typeof arr[0] === 'number' && typeof arr[1] === 'number' && arr[0] > 1_600_000_000;
+    }
+
+    function cmpTimestampAsc(a, b) {
+        if (!a.tsPair && !b.tsPair) return 0;
+        if (!a.tsPair) return -1;
+        if (!b.tsPair) return 1;
+        return a.tsPair[0] !== b.tsPair[0] ? a.tsPair[0] - b.tsPair[0] : a.tsPair[1] - b.tsPair[1];
+    }
+
+    function findAll(root, predicate, out = []) {
+        if (!Array.isArray(root)) return out;
+        if (predicate(root)) out.push(root);
+        for (const child of root) findAll(child, predicate, out);
+        return out;
+    }
+
+    function findMaxTimestamp(root) {
+        let best = null;
+        (function walk(node) {
+            if (!Array.isArray(node)) return;
+            if (isTimestampPair(node)) {
