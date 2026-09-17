@@ -1,0 +1,86 @@
+Gemini Universal Exporter v0.4.3 - Final Adversarial QA
+============================================================================
+Overall: PASS (7/7 groups)
+
+Real v0.4.2 finding used as the regression target:
+- ordinary RPC export succeeded
+- lazy history reached 43 user + 43 model turns
+- 18 immersive-entry-chip candidates were found
+- each v0.4.2 candidate had only 1 click target (the chip host)
+- all 18 closed-chip clicks failed to open a matching panel
+- the already-open gold Canvas was successfully extracted through ProseMirror
+
+v0.4.3 restrained change surface:
+- RPC/list/detail unchanged
+- Gem route and sessionStorage resume unchanged
+- lazy-history preload unchanged
+- Canvas candidate discovery unchanged
+- ProseMirror/Monaco extraction unchanged
+- only closed-Canvas opening/close verification/diagnostics and output filename stem changed
+
+Mature implementation borrowed:
+- Ophel SiteAdapter.simulateClick uses HTMLElement.click(); v0.4.3 now uses native click first.
+- Ophel scrolls the Canvas card into view, waits briefly, then verifies the matching panel.
+- Voyager/Ophel extraction selectors remain unchanged after opening.
+
+Additional live-DOM adaptation from the user fixture:
+- immersive-entry-chip visibly contains an exact “打开/Open” action even when no gem-processing-card exists.
+- v0.4.3 targets the exact action leaf/interactive ancestor before the host and reacquires the live node after virtual scrolling.
+
+QA groups:
+[PASS] JavaScript syntax
+[PASS] Real v0.4.2 gold fixture identified
+[PASS] Proven RPC/route/discovery/extraction functions unchanged
+[PASS] Source/state invariants
+[PASS] Undefined custom-helper audit
+[PASS] Executable live-shape Canvas opening harness
+[PASS] Canvas click plan bounded to five attempts
+
+Executable harness output:
+- PASS exact Open leaf discovered
+- PASS Share excluded
+- PASS Open leaf precedes chip host
+- PASS native leaf click bubbles and opens
+- PASS host-only click fixture remains closed
+- PASS stale chip reacquired by exact title
+- PASS Ophel card-first behavior retained
+- PASS document output stem strips .md
+- PASS code output stem strips .py
+- PASS no extension title preserved
+
+Regression lock detail:
+- [PASS] parseListPayload
+- [PASS] listAllConversationsRpc
+- [PASS] fetchAllConversationPayloads
+- [PASS] parseConversationDetailPayloads
+- [PASS] normalizeConversationId
+- [PASS] parseConversationHref
+- [PASS] pathMatchesConversation
+- [PASS] resolveCurrentConversationItem
+- [PASS] navigateToConversationForCanvas
+- [PASS] preloadCanvasLazyHistory
+- [PASS] findCanvasCandidatesInView
+- [PASS] proseMirrorToMarkdown
+- [PASS] extractDocumentFromPanel
+- [PASS] extractCodeFromPanel
+- [PASS] extractCanvasFromOpenPanel
+
+Acceptance target for next single-account run:
+- 20260109健身 should recover more than the one already-open Canvas; ideally all 19 marker-backed Canvas artifacts.
+- Gold document must remain intact: 力量掌控者：睡眠脊柱力学与被动支撑协议.md
+- Output filename must end in .md once, not .md.md.
+- If some chips still fail, candidate_attempts[].open_diagnostics now says which exact target/mode was tried and whether any wrong-title panel appeared.
+
+Additional exact-function open state-machine harness
+- PASS success returns artifact
+- PASS success uses one click
+- PASS success closes panel
+- PASS wrong panel falls through to next plan
+- PASS wrong panel recorded
+- PASS never-open fails loudly
+- PASS never-open is bounded to five attempts
+
+Final packaging checks
+- [PASS] JavaScript syntax
+- [PASS] .user.js and .txt are byte-identical
+- [PASS] ZIP CRC/integrity (zipfile.testzip)
