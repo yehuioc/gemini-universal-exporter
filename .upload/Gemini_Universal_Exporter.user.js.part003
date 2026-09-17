@@ -1,0 +1,297 @@
+        const entries = findBestChatEntryArray(payload);
+        const nextCursor = Array.isArray(payload) && typeof payload[1] === 'string' && payload[1] ? payload[1] : null;
+        const items = [];
+        for (const entry of entries) {
+            if (!looksLikeChatEntry(entry)) continue;
+            const rawId = String(entry[0]);
+            const id = rawId.replace(/^c_/, '');
+            const title = String(entry[1] || 'Untitled Conversation').replace(/\s+/g, ' ').trim() || 'Untitled Conversation';
+            items.push({
+                id,
+                chatId: id,
+                rawId,
+                kind: 'app',
+                title,
+                updatedAt: timestampPairToMs(entry[5]),
+                sourcePath: `${accountPrefix || ''}/app/${id}`,
+                basePrefix: accountPrefix || '',
+                discovery: 'MaZiqc',
+            });
+        }
+        return { items, nextCursor };
+    }
+
+    function chooseListPage(payloads, accountPrefix) {
+        let best = { items: [], nextCursor: null };
+        for (const payload of payloads || []) {
+            const parsed = parseListPayload(payload, accountPrefix);
+            if (parsed.items.length > best.items.length) best = parsed;
+            else if (parsed.items.length === best.items.length && parsed.nextCursor && !best.nextCursor) best = parsed;
+        }
+        return best;
+    }
+
+    async function listAllConversationsRpc(session, setStatus = () => {}, rpcCall = batchExecuteRpc) {
+        const merged = new Map();
+        const addItems = items => {
+            let added = 0;
+            for (const item of items) {
+                if (!merged.has(item.id)) { merged.set(item.id, item); added++; }
+                else {
+                    const old = merged.get(item.id);
+                    if ((!old.title || /^Untitled/.test(old.title)) && item.title) merged.set(item.id, { ...old, ...item });
+                }
+            }
+            return added;
+        };
+        const diagnostics = [];
+
+        for (const flag of CONFIG.LIST_FLAG_VARIANTS) {
+            let cursor = null;
+            const seenCursors = new Set();
+            let firstPageCount = 0;
+            let firstHadCursor = false;
+            for (let page = 0; page < CONFIG.LIST_MAX_PAGES; page++) {
+                isCancelled();
+                const args = cursor == null
+                    ? [CONFIG.LIST_PAGE_SIZE, null, [flag, null, 1]]
+                    : [CONFIG.LIST_PAGE_SIZE, cursor];
+                const payloads = await rpcCall(session, CONFIG.LIST_RPC_ID, args, '/app', setStatus, `历史列表 flag=${flag} p${page + 1}`);
+                const parsed = chooseListPage(payloads, session.accountPrefix);
+                if (page === 0) {
+                    firstPageCount = parsed.items.length;
+                    firstHadCursor = !!parsed.nextCursor;
+                }
+                diagnostics.push({ flag, page: page + 1, count: parsed.items.length, has_cursor: !!parsed.nextCursor });
+
+                if (cursor && !parsed.items.length && parsed.nextCursor) {
+                    throw new Error(`MaZiqc 分页异常：cursor=${cursor} 的页面为空但服务器仍返回 next cursor；为避免部分备份，已中止。`);
+                }
+                addItems(parsed.items);
+                setStatus(`📚 RPC 枚举历史 · 已发现 ${merged.size} 条`);
+
+                if (!parsed.nextCursor) break;
+                if (parsed.nextCursor === cursor || seenCursors.has(parsed.nextCursor)) {
+                    throw new Error('MaZiqc 返回重复分页 cursor；为避免死循环/漏数据，已中止。');
+                }
+                seenCursors.add(parsed.nextCursor);
+                cursor = parsed.nextCursor;
+                await sleep(randomBetween(250, 650));
+                if (page === CONFIG.LIST_MAX_PAGES - 1) {
+                    throw new Error(`MaZiqc 超过 ${CONFIG.LIST_MAX_PAGES} 页仍未结束；拒绝生成可能不完整的备份。`);
+                }
+            }
+
+            // Some builds return a full growing window without a cursor. If the
+            // first window is exactly full, grow the requested count until a
+            // round contributes no new ids. This is a fallback, not the normal path.
+            if (firstPageCount >= CONFIG.LIST_PAGE_SIZE && !firstHadCursor) {
+                let noNewRounds = 0;
+                for (let count = 100; count <= 2000 && noNewRounds < 2; count += 100) {
+                    const payloads = await rpcCall(session, CONFIG.LIST_RPC_ID, [count, null, [flag, null, 1]], '/app', setStatus, `历史列表扩窗 ${count}`);
+                    const parsed = chooseListPage(payloads, session.accountPrefix);
+                    const added = addItems(parsed.items);
+                    diagnostics.push({ flag, growing_count: count, count_returned: parsed.items.length, added });
+                    setStatus(`📚 RPC 扩窗核验 · 已发现 ${merged.size} 条`);
+                    if (!added) noNewRounds++; else noNewRounds = 0;
+                    if (parsed.items.length < count) break;
+                    await sleep(randomBetween(300, 700));
+                }
+            }
+        }
+
+        // Oldest/minimal builds occasionally accept [20] rather than the flag
+        // envelope. Use once only if the verified variants found nothing.
+        if (!merged.size) {
+            const payloads = await rpcCall(session, CONFIG.LIST_RPC_ID, [CONFIG.LIST_PAGE_SIZE], '/app', setStatus, '历史列表兼容探测');
+            const parsed = chooseListPage(payloads, session.accountPrefix);
+            addItems(parsed.items);
+            diagnostics.push({ compatibility_probe: true, count: parsed.items.length, has_cursor: !!parsed.nextCursor });
+        }
+
+        if (!merged.size) {
+            throw new Error('MaZiqc 成功请求后仍没有解析到任何历史对话。已停止，不再依赖侧栏 DOM 猜 ID。');
+        }
+
+        const items = Array.from(merged.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        return { items, diagnostics };
+    }
+
+    function getPath(node, path) {
+        let cur = node;
+        for (const k of path) {
+            if (!Array.isArray(cur) || k < 0 || k >= cur.length) return undefined;
+            cur = cur[k];
+        }
+        return cur;
+    }
+
+    function isInternalPlaceholderText(text) {
+        return /https?:\/\/[^\s]*googleusercontent\.com\/(?:[^\s/]+_content|immersive_entry_chip)\//i.test(String(text || ''));
+    }
+
+    function stripInternalPlaceholderLines(text) {
+        return String(text || '').split(/\r?\n/).filter(line => !isInternalPlaceholderText(line.trim())).join('\n').trim();
+    }
+
+    function recursivelyFindBestString(node) {
+        let best = '';
+        const walk = value => {
+            if (typeof value === 'string') {
+                const s = value.trim();
+                if (!s || looksLikeInternalId(s) || /^https?:\/\/googleusercontent\.com\//i.test(s)) return;
+                if (s.length > best.length) best = s;
+                return;
+            }
+            if (Array.isArray(value)) for (const child of value) walk(child);
+        };
+        walk(node);
+        return best;
+    }
+
+    function inferLanguageFromFilename(filename) {
+        const ext = String(filename || '').toLowerCase().split('.').pop();
+        const map = {
+            js: 'javascript', jsx: 'javascript', ts: 'typescript', tsx: 'typescript', py: 'python',
+            html: 'html', htm: 'html', css: 'css', json: 'json', md: 'markdown', markdown: 'markdown',
+            sh: 'bash', bash: 'bash', ps1: 'powershell', java: 'java', kt: 'kotlin', swift: 'swift',
+            go: 'go', rs: 'rust', c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', cxx: 'cpp', cs: 'csharp',
+            sql: 'sql', yaml: 'yaml', yml: 'yaml', xml: 'xml', txt: 'text', csv: 'csv',
+        };
+        return map[ext] || (ext && ext.length <= 10 ? ext : 'text');
+    }
+
+    function canvasTypeFromFilename(filename) {
+        const lang = inferLanguageFromFilename(filename);
+        return ['markdown', 'text', 'csv'].includes(lang) ? 'document' : 'code';
+    }
+
+    function extractCanvasListFromCandidate(candidate) {
+        const block30 = Array.isArray(candidate?.[30]) ? candidate[30] : [];
+        const out = [];
+        for (const item of block30) {
+            if (!Array.isArray(item) || Number(item[10]) !== 2) continue;
+            const title = typeof item[2] === 'string' ? item[2].trim() : '';
+            const filename = typeof item[9] === 'string' ? item[9].trim() : '';
+            const documentId = typeof item[1] === 'string' ? item[1] : null;
+            let content = recursivelyFindBestString(item[8]);
+            if (!content) content = typeof item[4] === 'string' ? item[4].trim() : recursivelyFindBestString(item[4]);
+            if (!content) continue;
+            const language = inferLanguageFromFilename(filename);
+            out.push({
+                type: canvasTypeFromFilename(filename),
+                title: title || filename || 'Gemini Canvas',
+                filename: filename || null,
+                content,
+                language,
+                document_id: documentId,
+                source: 'hNvQHb.candidate[30]',
+            });
+        }
+        return out;
+    }
+
+    function collectCanvasMarkerIndexes(node, out = new Set()) {
+        if (typeof node === 'string') {
+            for (const m of node.matchAll(/immersive_entry_chip\/(\d+)/g)) out.add(Number(m[1]));
+        } else if (Array.isArray(node)) {
+            for (const child of node) collectCanvasMarkerIndexes(child, out);
+        }
+        return out;
+    }
+
+    function pickServedCandidate(turn) {
+        const candidates = getPath(turn, [3, 0]);
+        if (!Array.isArray(candidates)) return null;
+        for (const candidate of candidates) {
+            if (!Array.isArray(candidate)) continue;
+            const direct = getPath(candidate, [1, 0]);
+            const canvas = extractCanvasListFromCandidate(candidate);
+            if ((typeof direct === 'string' && direct.trim()) || canvas.length) return candidate;
+        }
+        return candidates.find(Array.isArray) || null;
+    }
+
+    function assistantTextFromCandidate(candidate) {
+        if (!Array.isArray(candidate)) return '';
+        let text = getPath(candidate, [1, 0]);
+        if (typeof text !== 'string') text = '';
+        if (text && /^https?:\/\/googleusercontent\.com\/card_content\/\d+/i.test(text.trim())) {
+            const fallback = getPath(candidate, [22, 0]);
+            if (typeof fallback === 'string' && fallback.trim()) text = fallback;
+        }
+        if (!text) {
+            const fallback = getPath(candidate, [22, 0]);
+            if (typeof fallback === 'string' && fallback.trim() && !isInternalPlaceholderText(fallback)) text = fallback;
+        }
+        return stripInternalPlaceholderLines(text);
+    }
+
+    function extractThinkingBestEffort(candidate, assistantText) {
+        if (!Array.isArray(candidate)) return null;
+        try {
+            const clone = candidate.slice();
+            if (clone.length > 22) clone[22] = null;
+            if (clone.length > 30) clone[30] = null; // never mislabel Canvas as thinking
+            return extractReasoningFromAssistantNode(clone, assistantText) || null;
+        } catch (_) { return null; }
+    }
+
+    function parseDetailTurn(turn, chronologicalIndex = 0) {
+        if (!Array.isArray(turn)) return null;
+        const userDirect = getPath(turn, [2, 0, 0]);
+        let userText = typeof userDirect === 'string' ? userDirect.trim() : '';
+        if (!userText) {
+            try {
+                const userNodes = findAll(turn, n => isUserMessageNode(n, false));
+                if (userNodes[0]) userText = getUserTextFromNode(userNodes[0]);
+            } catch (_) {}
+        }
+
+        const candidate = pickServedCandidate(turn);
+        const assistantText = candidate ? assistantTextFromCandidate(candidate) : '';
+        const thoughtsText = candidate ? extractThinkingBestEffort(candidate, assistantText) : null;
+        const canvas = candidate ? extractCanvasListFromCandidate(candidate) : [];
+        const markerIndexes = candidate ? Array.from(collectCanvasMarkerIndexes(candidate)).sort((a, b) => a - b) : [];
+        const tsPair = Array.isArray(turn[4]) ? turn[4] : null;
+        const turnId = typeof getPath(turn, [0, 1]) === 'string' ? getPath(turn, [0, 1]) : null;
+
+        return {
+            index: chronologicalIndex,
+            turn_id: turnId,
+            timestamp_ms: timestampPairToMs(tsPair),
+            userText,
+            assistantText,
+            thoughtsText,
+            canvas,
+            canvas_marker_indexes: markerIndexes,
+            canvas_possible_miss: markerIndexes.length > canvas.length,
+        };
+    }
+
+    function extractTurnsArrayFromDetailPayload(payload) {
+        return Array.isArray(payload?.[0]) ? payload[0] : [];
+    }
+
+    function detailNextCursor(payload) {
+        return Array.isArray(payload) && typeof payload[1] === 'string' && payload[1] ? payload[1] : null;
+    }
+
+    async function fetchAllConversationPayloads(session, item, setStatus = () => {}, rpcCall = batchExecuteRpc) {
+        const rawId = item.rawId || (String(item.chatId).startsWith('c_') ? item.chatId : `c_${item.chatId}`);
+        const payloadsOut = [];
+        let cursor = null;
+        const seenCursors = new Set();
+        let detailFilter = [1];
+
+        for (let page = 0; page < CONFIG.DETAIL_MAX_PAGES; page++) {
+            isCancelled();
+            const args = [rawId, CONFIG.DETAIL_PAGE_SIZE, cursor, 1, detailFilter, [4], null, 1];
+            let payloads = await rpcCall(session, CONFIG.DETAIL_RPC_ID, args, item.sourcePath, setStatus, `对话详情 ${page + 1}`);
+            let payload = payloads.find(p => Array.isArray(p?.[0])) || payloads[0];
+            let turns = extractTurnsArrayFromDetailPayload(payload);
+            let next = detailNextCursor(payload);
+
+            // Compatibility fallback seen in another maintained 2026 client.
+            if (page === 0 && !turns.length && !next && detailFilter[0] === 1) {
+                detailFilter = [0];
