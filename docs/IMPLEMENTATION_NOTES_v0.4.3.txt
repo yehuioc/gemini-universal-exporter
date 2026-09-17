@@ -1,0 +1,22 @@
+Gemini Universal Exporter v0.4.3 - Implementation Notes
+
+Why this version exists
+- v0.4.2 proved the end-to-end extraction path by recovering the already-open gold Canvas.
+- The same live run found 18 closed immersive-entry-chip entries, all with visible Open text, but v0.4.2 exposed only the chip host as a click target and none opened a panel.
+
+Borrowed mature behavior
+- Ophel's current SiteAdapter.simulateClick is HTMLElement.click(). v0.4.3 therefore uses native click as the first strategy instead of sending pointer/mouse events first.
+- Ophel's Canvas opener scrolls the target into view and verifies the resulting panel/title. v0.4.3 retains that contract.
+- Voyager/Ophel ProseMirror/Monaco extraction remains unchanged.
+
+Live-DOM-specific hardening
+- Exact visible Open/View/Preview/Edit leaf text is a safe target even when it is a span/div, because a click bubbles to the delegated host handler.
+- Share/Download/Copy/Menu/Close/Delete are explicitly denied.
+- Candidate DOM nodes are reacquired by source + normalized title after scrolling, because Gemini's infinite scroller may replace nodes.
+- Panel waits distinguish no panel from a wrong-title panel.
+- Panel closure is verified before the next Canvas.
+- Click fallbacks are capped at five attempts per Canvas.
+- Canvas output stems strip one known source extension so foo.md exports as foo.md, not foo.md.md.
+
+State-machine adversarial coverage
+- Exact openAndExtractCanvasCandidate function tested with: first-click success; wrong-title panel then fallback success; never-open path bounded to five clicks and loud failure.
