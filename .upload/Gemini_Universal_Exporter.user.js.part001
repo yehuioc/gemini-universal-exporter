@@ -1,0 +1,327 @@
+// ==UserScript==
+// @name         Gemini Universal Exporter (Full History, JSON + Markdown + ZIP)
+// @namespace    local.gemini.universal.exporter
+// @version      0.4.3
+// @description  Gemini history exporter: MaZiqc/hNvQHb RPC + Gem-route-aware resume + live-node Canvas opening + Ophel/Voyager extraction.
+// @author       local adaptation
+// @match        https://gemini.google.com/*
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+// @grant        none
+// @run-at       document-start
+// @license      MIT
+// ==/UserScript==
+
+/*
+ * Gemini Universal Exporter v0.4.3
+ *
+ * Design sources / inspirations (MIT):
+ * - ChatGPT Universal Exporter (Markdown Support, Selective + Retry Failed):
+ *   ZIP + JSON/MD pairing + retry/backoff + failure manifest patterns.
+ * - Gemini Chat Markdown Exporter (Thoughts Included) by NoahTheGinger:
+ *   same-origin Gemini batchexecute RPC, anti-CSRF token discovery, and
+ *   payload/message-shape extraction ideas.
+ * - gemini-chat-exporter by David Malko:
+ *   full-history sidebar harvesting and "fail loudly / don't silently trust stale data"
+ *   reliability ideas.
+ *
+ * IMPORTANT:
+ * Gemini's internal RPC and DOM are undocumented and can change. This script is
+ * deliberately conservative: one detail request at a time, jitter between calls,
+ * long cooldowns, HTTP 429 Retry-After handling, and explicit failure manifests.
+ *
+ * v0.3.2 adds the interaction model from the user's ChatGPT exporter:
+ * first fetch only the conversation list, then choose ONE conversation for a
+ * low-risk test export or choose full-history export. Single and full modes use
+ * the exact same hNvQHb + Canvas recovery pipeline, so a single-conversation
+ * Canvas test is representative of the full export without hammering the account.
+
+ * v0.4.3 Canvas opening hardening:
+ * - Keeps the v0.4.2 discovery/lazy-history/extraction path unchanged.
+ * - Reacquires live Canvas nodes after scrolling to avoid virtual-DOM stale references.
+ * - Uses Ophel-style native HTMLElement.click() first; synthesized events are fallback only.
+ * - Targets exact Open/View/Edit leaf text inside immersive-entry-chip before the chip host.
+ * - Separates no-panel vs wrong-panel-title diagnostics and waits for panel content readiness.
+ * - Verifies panel closure before attempting the next Canvas.
+ * - Avoids duplicate .md.md / .py.py style output names.
+ *
+ * v0.4.1 route-resume fix:
+ * - Gemini can redirect /app/<conversationId> to /gem/<gemId>/<conversationId>.
+ * - Route identity is therefore validated by conversationId, not pathname equality.
+ * - The resolved Gem route is preserved in exported metadata while the originally
+ *   requested /app URL is retained for diagnostics.
+ *
+ * v0.4.0 Canvas architecture is based on current 2026 Gemini implementations:
+ * - Ophel: identify [data-test-id="gem-processing-card"], validate article/code_blocks
+ *   icons, click the card then its immersive-entry-chip fallback, verify panel title.
+ * - Gemini Voyager: Document Canvas -> immersive-editor .ProseMirror; Code/App Canvas
+ *   -> code-immersive-panel / Monaco .view-lines .view-line.
+ * Single mode keeps ID-direct navigation + sessionStorage resume to avoid sidebar churn.
+ */
+
+(function () {
+    'use strict';
+
+    // --------------------------- Configuration ---------------------------
+    const CONFIG = {
+        // Normal pacing. Deliberately slower than the ChatGPT source script.
+        DETAIL_DELAY_MIN: 2500,
+        DETAIL_DELAY_MAX: 5500,
+        LIST_SCROLL_DELAY_MIN: 650,
+        LIST_SCROLL_DELAY_MAX: 1100,
+
+        // Backoff / retries.
+        MAX_RETRIES: 6,
+        RATE_LIMIT_FALLBACK_MS: 120000, // 2 min when 429 has no Retry-After.
+        SERVER_ERROR_BASE_MS: 12000,
+        SERVER_ERROR_MAX_MS: 180000,
+
+        // Periodic cooling for large histories.
+        LONG_COOLDOWN_EVERY: 40,
+        LONG_COOLDOWN_MIN_MS: 45000,
+        LONG_COOLDOWN_MAX_MS: 90000,
+
+        // Sidebar harvesting.
+        LIST_STABLE_ROUNDS: 6,
+        LIST_MAX_SCROLL_ROUNDS: 500,
+
+        // Gemini detail RPC. Current as of the referenced exporter (2026).
+        LIST_RPC_ID: 'MaZiqc',
+        LIST_PAGE_SIZE: 20,
+        LIST_MAX_PAGES: 200,
+        LIST_FLAG_VARIANTS: [0, 1],
+        DETAIL_RPC_ID: 'hNvQHb',
+        DETAIL_PAGE_SIZE: 20,
+        DETAIL_MAX_PAGES: 200,
+        RPC_TIMEOUT_MS: 30000,
+
+        // Raw RPC payloads can be much larger than the readable transcript.
+        // Leave off by default for heavy accounts to reduce browser RAM/ZIP size.
+        INCLUDE_RAW_PAYLOADS: false,
+
+        // Canvas / artifact backup. The full-export path extracts structured
+        // Canvas blocks from hNvQHb candidate ai_data[30]. Legacy DOM helpers are
+        // retained only as dormant diagnostics/compatibility code.
+        INCLUDE_CANVAS: true,
+        CANVAS_SCAN_ALL_CONVERSATIONS: false,
+        // v0.3.1: only conversations whose RPC turns expose Canvas markers but
+        // no complete structured Canvas are opened in the UI for recovery.
+        CANVAS_DOM_FALLBACK_FOR_SUSPECTS: true,
+        CANVAS_NAV_TIMEOUT_MS: 12000,
+        CANVAS_RENDER_SETTLE_MS: 900,
+        CANVAS_SCROLL_DELAY_MS: 450,
+        CANVAS_PANEL_TIMEOUT_MS: 4500,
+        CANVAS_PANEL_TITLE_TIMEOUT_MS: 3500,
+        CANVAS_MAX_SCROLL_STEPS: 220,
+        CANVAS_BOTTOM_STABLE_ROUNDS: 3,
+        CANVAS_HISTORY_PRELOAD_WAIT_MS: 700,
+        CANVAS_HISTORY_PRELOAD_MAX_ROUNDS: 24,
+        CANVAS_HISTORY_PRELOAD_STABLE_ROUNDS: 3,
+        CANVAS_HISTORY_PRELOAD_WHEEL_DELTA_Y: -800,
+        CANVAS_DIAGNOSTIC_SAMPLE_LIMIT: 16,
+        CANVAS_NATIVE_CLICK_WAIT_MS: 2800,
+        CANVAS_FALLBACK_CLICK_WAIT_MS: 1600,
+        CANVAS_CONTENT_READY_TIMEOUT_MS: 3500,
+        CANVAS_CLOSE_TIMEOUT_MS: 2500,
+
+        // UI.
+        BUTTON_ID: 'gemini-universal-exporter-btn',
+        PANEL_ID: 'gemini-universal-exporter-panel',
+        SINGLE_CANVAS_RESUME_KEY: 'gue:v0.4.3:single-canvas-resume',
+        SINGLE_CANVAS_RESUME_TTL_MS: 30 * 60 * 1000,
+    };
+
+    // ------------------------------ State -------------------------------
+    let running = false;
+    let cancelled = false;
+    const metaById = new Map();
+
+    // ------------------------------ Helpers -----------------------------
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const randomBetween = (min, max) => min + Math.random() * (max - min);
+    const listJitter = () => randomBetween(CONFIG.LIST_SCROLL_DELAY_MIN, CONFIG.LIST_SCROLL_DELAY_MAX);
+    const detailJitter = () => randomBetween(CONFIG.DETAIL_DELAY_MIN, CONFIG.DETAIL_DELAY_MAX);
+
+    function writeSingleCanvasResumeTask(task) {
+        try { sessionStorage.setItem(CONFIG.SINGLE_CANVAS_RESUME_KEY, JSON.stringify({ schema: 1, created_at_ms: Date.now(), ...task })); return true; }
+        catch (e) { console.error('[Gemini Universal Exporter] cannot persist single Canvas resume task', e); return false; }
+    }
+    function readSingleCanvasResumeTask() {
+        try {
+            const raw = sessionStorage.getItem(CONFIG.SINGLE_CANVAS_RESUME_KEY);
+            if (!raw) return null;
+            const task = JSON.parse(raw);
+            if (!task || !task.item || !task.item.chatId) return null;
+            if (!task.created_at_ms || Date.now() - task.created_at_ms > CONFIG.SINGLE_CANVAS_RESUME_TTL_MS) { sessionStorage.removeItem(CONFIG.SINGLE_CANVAS_RESUME_KEY); return null; }
+            return task;
+        } catch (e) { console.warn('[Gemini Universal Exporter] invalid single Canvas resume task', e); try { sessionStorage.removeItem(CONFIG.SINGLE_CANVAS_RESUME_KEY); } catch (_) {} return null; }
+    }
+    function clearSingleCanvasResumeTask() { try { sessionStorage.removeItem(CONFIG.SINGLE_CANVAS_RESUME_KEY); } catch (_) {} }
+    function directNavigateToConversation(item, setStatus = () => {}) {
+        // Always navigate to the originally requested route. Gemini is allowed
+        // to redirect it to a /gem/<gemId>/<conversationId> route.
+        const target = buildRequestedConversationUrl(item);
+        setStatus(`🧭 直达 Canvas 对话 · ${item.title}`);
+        console.info('[Gemini Universal Exporter] direct navigation for single Canvas resume', {
+            title: item.title,
+            chatId: item.chatId,
+            requestedUrl: target,
+        });
+        location.assign(target);
+    }
+
+    function sanitizeFilename(name) {
+        const s = String(name || 'Untitled Conversation')
+            .replace(/[\/\\?%*:|"<>]/g, '-')
+            .replace(/[\u0000-\u001f]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 160);
+        return s || 'Untitled Conversation';
+    }
+
+    function escapeMdInline(text) {
+        return String(text || '').replace(/\r\n?/g, '\n');
+    }
+
+    function downloadFile(blob, filename) {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+
+    async function sha256Hex(text) {
+        try {
+            const bytes = new TextEncoder().encode(text);
+            const digest = await crypto.subtle.digest('SHA-256', bytes);
+            return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+        } catch (_) {
+            // Fallback non-cryptographic signature for older browsers.
+            let h = 2166136261;
+            const s = String(text || '');
+            for (let i = 0; i < s.length; i++) {
+                h ^= s.charCodeAt(i);
+                h = Math.imul(h, 16777619);
+            }
+            return `fnv1a-${(h >>> 0).toString(16)}`;
+        }
+    }
+
+    function parseRetryAfterMs(headers) {
+        const value = headers?.get?.('Retry-After');
+        if (!value) return null;
+        const seconds = Number(value);
+        if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+        const dateMs = Date.parse(value);
+        if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+        return null;
+    }
+
+    function isCancelled() {
+        if (cancelled) throw new Error('用户已取消导出');
+    }
+
+    // ------------------------- Gemini page state -------------------------
+    function currentAccountPrefix() {
+        const m = location.pathname.match(/^\/u\/(\d+)(?:\/|$)/);
+        return m ? `/u/${m[1]}` : '';
+    }
+
+    function getLang() {
+        return document.documentElement.lang || 'zh-CN';
+    }
+
+    function getAtToken() {
+        const input = document.querySelector('input[name="at"]');
+        if (input?.value) return input.value;
+
+        try {
+            if (window.WIZ_global_data?.SNlM0e) return window.WIZ_global_data.SNlM0e;
+        } catch (_) {}
+
+        // Avoid scanning huge DOM repeatedly unless needed.
+        const html = document.documentElement.innerHTML;
+        const m = html.match(/"SNlM0e":"([^"]+)"/);
+        return m ? m[1] : null;
+    }
+
+    function normalizePath(path) {
+        if (!path) return null;
+        try {
+            const u = new URL(path, location.origin);
+            return u.pathname;
+        } catch (_) {
+            return String(path).split(/[?#]/)[0];
+        }
+    }
+
+    function parseConversationHref(href) {
+        const path = normalizePath(href);
+        if (!path) return null;
+
+        const app = path.match(/(?:^|\/)app\/([^/?#]+)/);
+        if (app) {
+            const userPrefixMatch = path.match(/^\/u\/(\d+)/);
+            const basePrefix = userPrefixMatch ? `/u/${userPrefixMatch[1]}` : currentAccountPrefix();
+            const sourcePath = `${basePrefix}/app/${app[1]}`;
+            return { id: app[1], chatId: app[1], kind: 'app', sourcePath, basePrefix };
+        }
+
+        const gem = path.match(/(?:^|\/)gem\/([^/?#]+)\/([^/?#]+)/);
+        if (gem) {
+            const userPrefixMatch = path.match(/^\/u\/(\d+)/);
+            const basePrefix = userPrefixMatch ? `/u/${userPrefixMatch[1]}` : currentAccountPrefix();
+            const sourcePath = `${basePrefix}/gem/${gem[1]}/${gem[2]}`;
+            return {
+                id: `gem_${gem[1]}_${gem[2]}`,
+                chatId: gem[2],
+                gemId: gem[1],
+                kind: 'gem',
+                sourcePath,
+                basePrefix,
+            };
+        }
+
+        return null;
+    }
+
+    function normalizeConversationId(value) {
+        return String(value || '').replace(/^c_/, '').trim();
+    }
+
+    function buildRequestedConversationUrl(item) {
+        if (item?.requestedUrl) return item.requestedUrl;
+        const path = item?.requestedSourcePath || item?.sourcePath || '';
+        return `${location.origin}${path}`;
+    }
+
+    function buildConversationUrl(item) {
+        if (item?.resolvedUrl) return item.resolvedUrl;
+        return `${location.origin}${item.sourcePath}`;
+    }
+
+    function resolveCurrentConversationItem(item, pathLike = location.pathname) {
+        const currentRoute = parseConversationHref(pathLike);
+        const wantedId = normalizeConversationId(item?.chatId);
+        if (!currentRoute || !wantedId || normalizeConversationId(currentRoute.chatId) !== wantedId) {
+            return null;
+        }
+
+        const requestedSourcePath = item.requestedSourcePath || item.sourcePath;
+        const requestedUrl = item.requestedUrl || `${location.origin}${requestedSourcePath}`;
+        const resolvedSourcePath = currentRoute.sourcePath;
+        const resolvedUrl = `${location.origin}${resolvedSourcePath}`;
+
+        return {
+            ...item,
+            // Keep the MaZiqc identity/id stable; only enrich the route metadata.
+            kind: currentRoute.kind,
+            gemId: currentRoute.gemId || null,
+            basePrefix: currentRoute.basePrefix,
+            requestedKind: item.requestedKind || item.kind || 'app',
+            requestedSourcePath,
+            requestedUrl,
+            sourcePath: resolvedSourcePath,
