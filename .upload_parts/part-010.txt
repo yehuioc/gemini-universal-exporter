@@ -278,4 +278,4 @@
                             parsed.canvases.map(x => x.content_sha256).filter(Boolean)
                         );
                         for (const recovered of domCanvasFallback.artifacts || []) {
-                            if (!recovered.content_sha 
+                            if (!recovered.content_sha
