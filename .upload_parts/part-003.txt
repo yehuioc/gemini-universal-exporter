@@ -139,7 +139,7 @@
         // Current Gemini rows commonly contain JSON-ish payloads with "c_<id>".
         // Accept escaped quotes and minor formatting changes.
         const patterns = [
-            /(?:\\?\[|["'])c_([A-Za-z0-9_-]{6,})/,
+            /(?:\\?\[|[\"'])c_([A-Za-z0-9_-]{6,})/,
             /c_([A-Za-z0-9_-]{6,})/,
         ];
         for (const re of patterns) {
